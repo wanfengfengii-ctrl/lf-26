@@ -65,6 +65,12 @@ sidebar = dbc.Col([
             className="mb-2"
         ),
         dbc.NavLink(
+            [html.I(className="bi bi-compass me-2"), "勘测方案模拟与补测优化"],
+            href="/resurvey-simulation",
+            active="exact",
+            className="mb-2"
+        ),
+        dbc.NavLink(
             [html.I(className="bi bi-gear me-2"), "数据管理"],
             href="/data-management",
             active="exact",

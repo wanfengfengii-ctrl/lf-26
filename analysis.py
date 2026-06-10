@@ -1444,3 +1444,694 @@ def generate_quality_report(cave_name: str, batch_name: str, quality_result: Dic
     report_lines.append("=" * 60)
 
     return "\n".join(report_lines)
+
+
+def _generate_supplementary_angles(missing_intervals: List[Dict], anomaly_regions: List[Dict],
+                                   batch_diff_angles: List[float],
+                                   num_points: int,
+                                   existing_measurements: List[Dict] = None) -> List[Dict]:
+    candidates = []
+
+    for interval in missing_intervals:
+        start = interval['start_angle']
+        end = interval['end_angle']
+        gap = interval['gap_size']
+        wraps = interval.get('wraps', False)
+
+        if wraps:
+            angular_span = (360 - start) + end
+        else:
+            angular_span = end - start
+
+        n_in_gap = max(1, int(angular_span / 15.0))
+        if wraps:
+            angles_in_gap = [(start + (360 - start + end) * k / (n_in_gap + 1)) % 360
+                             for k in range(1, n_in_gap + 1)]
+        else:
+            angles_in_gap = [(start + angular_span * k / (n_in_gap + 1))
+                             for k in range(1, n_in_gap + 1)]
+
+        for angle in angles_in_gap:
+            candidates.append({
+                'angle': angle,
+                'priority': 'high',
+                'reason': f'缺失区间补测 ({start:.0f}°-{end:.0f}°, 间隔{gap:.1f}°)',
+                'source': 'missing_interval',
+                'weight': 3.0
+            })
+
+    for region in anomaly_regions:
+        start = region['start_angle']
+        end = region['end_angle']
+        mid_angle = (start + end) / 2.0
+
+        candidates.append({
+            'angle': mid_angle % 360,
+            'priority': 'high',
+            'reason': f'异常区域验证 ({region["anomaly_type"]}: {start:.0f}°-{end:.0f}°)',
+            'source': 'anomaly',
+            'weight': 2.5
+        })
+
+        if end - start > 20:
+            q1 = (start + mid_angle) / 2.0
+            q3 = (mid_angle + end) / 2.0
+            candidates.append({
+                'angle': q1 % 360,
+                'priority': 'medium',
+                'reason': f'异常区域加密 ({region["anomaly_type"]}: {start:.0f}°-{mid_angle:.0f}°)',
+                'source': 'anomaly',
+                'weight': 2.0
+            })
+            candidates.append({
+                'angle': q3 % 360,
+                'priority': 'medium',
+                'reason': f'异常区域加密 ({region["anomaly_type"]}: {mid_angle:.0f}°-{end:.0f}°)',
+                'source': 'anomaly',
+                'weight': 2.0
+            })
+
+    for angle in batch_diff_angles:
+        candidates.append({
+            'angle': angle % 360,
+            'priority': 'medium',
+            'reason': f'批次差异验证 ({angle:.0f}°)',
+            'source': 'batch_diff',
+            'weight': 1.5
+        })
+
+    if existing_measurements and len(existing_measurements) > 0:
+        df = pd.DataFrame(existing_measurements).sort_values('angle')
+        angles = df['angle'].values
+        distances = df['distance'].values
+        depths = df['depth'].values
+
+        for i in range(len(angles)):
+            j = (i + 1) % len(angles)
+            if j == 0:
+                gap = (360 - angles[i]) + angles[j]
+                mid_angle = (angles[i] + angles[j] + 360) / 2 % 360
+            else:
+                gap = angles[j] - angles[i]
+                mid_angle = (angles[i] + angles[j]) / 2
+
+            if gap > 10:
+                dist_var = abs(distances[j] - distances[i]) / max(distances[i], distances[j], 1)
+                depth_var = abs(depths[j] - depths[i]) / max(depths[i], depths[j], 1)
+                variability = dist_var + depth_var
+
+                priority = 'low'
+                weight = 1.0
+
+                if gap > 30:
+                    priority = 'medium'
+                    weight = 1.8
+                elif gap > 20:
+                    priority = 'low'
+                    weight = 1.3
+
+                if variability > 0.3:
+                    weight += 0.5
+                    if priority == 'low':
+                        priority = 'medium'
+
+                candidates.append({
+                    'angle': float(mid_angle),
+                    'priority': priority,
+                    'reason': f'大间隔加密 ({angles[i]:.0f}°-{angles[j]:.0f}°, 间隔{gap:.1f}°)',
+                    'source': 'gap_filling',
+                    'weight': weight
+                })
+
+    candidates.sort(key=lambda x: x['weight'], reverse=True)
+
+    seen = set()
+    unique = []
+    for c in candidates:
+        rounded = round(c['angle'], 1)
+        if rounded not in seen:
+            is_duplicate_of_existing = False
+            if existing_measurements:
+                for m in existing_measurements:
+                    if abs(c['angle'] - m['angle']) < 2.0 or \
+                       abs(c['angle'] - m['angle'] + 360) < 2.0 or \
+                       abs(c['angle'] - m['angle'] - 360) < 2.0:
+                        is_duplicate_of_existing = True
+                        break
+            if not is_duplicate_of_existing:
+                seen.add(rounded)
+                unique.append(c)
+
+    if len(unique) < num_points:
+        if existing_measurements and len(existing_measurements) > 0:
+            df = pd.DataFrame(existing_measurements).sort_values('angle')
+            existing_angles = set(round(a, 1) for a in df['angle'].values)
+            
+            for step in [5, 10, 15, 20, 30, 45, 60]:
+                if len(unique) >= num_points:
+                    break
+                for angle in range(0, 360, step):
+                    if len(unique) >= num_points:
+                        break
+                    angle_float = float(angle)
+                    rounded = round(angle_float, 1)
+                    if rounded not in seen and rounded not in existing_angles:
+                        unique.append({
+                            'angle': angle_float,
+                            'priority': 'low',
+                            'reason': f'均匀加密补测 ({angle}°)',
+                            'source': 'uniform_density',
+                            'weight': 0.8
+                        })
+                        seen.add(rounded)
+
+    high_count = sum(1 for c in unique if c['priority'] == 'high')
+    med_count = sum(1 for c in unique if c['priority'] == 'medium')
+    low_count = sum(1 for c in unique if c['priority'] == 'low')
+
+    return unique[:num_points]
+
+
+def _simulate_volume_with_supplements(measurements: List[Dict],
+                                      supplement_angles: List[Dict]) -> Dict:
+    if not measurements:
+        return {'volume': 0, 'quality_score': 0}
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    angles_ext = np.concatenate([angles - 360, angles, angles + 360])
+    distances_ext = np.concatenate([distances, distances, distances])
+    depths_ext = np.concatenate([depths, depths, depths])
+
+    from scipy.interpolate import interp1d
+
+    valid = np.diff(angles_ext) != 0
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) < 2:
+        return calculate_volume_conical(measurements)
+
+    angles_ext_clean = angles_ext[valid_idx]
+    distances_ext_clean = distances_ext[valid_idx]
+    depths_ext_clean = depths_ext[valid_idx]
+
+    f_dist = interp1d(angles_ext_clean, distances_ext_clean, kind='linear', fill_value='extrapolate')
+    f_depth = interp1d(angles_ext_clean, depths_ext_clean, kind='linear', fill_value='extrapolate')
+
+    all_angles = list(angles)
+    all_distances = list(distances)
+    all_depths = list(depths)
+
+    for sup in supplement_angles:
+        sa = sup['angle']
+        if sa < 0:
+            sa += 360
+        if sa >= 360:
+            sa -= 360
+
+        is_close = any(abs(sa - a) < 1.0 or abs(sa - a + 360) < 1.0 or abs(sa - a - 360) < 1.0
+                       for a in all_angles)
+        if is_close:
+            continue
+
+        try:
+            sd = float(f_dist(sa))
+            sh = float(f_depth(sa))
+            sd = max(0, sd)
+            sh = max(0, sh)
+            all_angles.append(sa)
+            all_distances.append(sd)
+            all_depths.append(sh)
+        except Exception:
+            continue
+
+    enhanced_measurements = [
+        {'angle': a, 'distance': d, 'depth': h}
+        for a, d, h in zip(all_angles, all_distances, all_depths)
+    ]
+
+    volume_result = calculate_volume_conical(enhanced_measurements)
+
+    new_count = len(all_angles) - len(measurements)
+    max_gap_before = _compute_max_gap(measurements)
+    max_gap_after = _compute_max_gap(enhanced_measurements)
+
+    coverage_before = len(measurements) / 24.0
+    coverage_after = len(all_angles) / 24.0
+
+    return {
+        'volume': volume_result['volume'],
+        'max_depth': volume_result['max_depth'],
+        'max_distance': volume_result['max_distance'],
+        'point_count': len(all_angles),
+        'added_points': new_count,
+        'max_gap_before': max_gap_before,
+        'max_gap_after': max_gap_after,
+        'coverage_ratio_before': min(coverage_before, 1.0),
+        'coverage_ratio_after': min(coverage_after, 1.0),
+        'enhanced_measurements': enhanced_measurements
+    }
+
+
+def _compute_max_gap(measurements: List[Dict]) -> float:
+    if len(measurements) < 2:
+        return 360.0
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+    max_gap = 0
+    for i in range(len(angles)):
+        j = (i + 1) % len(angles)
+        if j == 0:
+            gap = (360 - angles[i]) + angles[j]
+        else:
+            gap = angles[j] - angles[i]
+        max_gap = max(max_gap, gap)
+    return max_gap
+
+
+def estimate_volume_accuracy(measurements: List[Dict]) -> Dict:
+    if not measurements or len(measurements) < 3:
+        return {
+            'accuracy_score': 0,
+            'estimated_error_pct': 100.0,
+            'error_level': '无法评估',
+            'confidence': '低'
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    n_points = len(angles)
+    avg_gap = 360.0 / n_points
+    max_gap = _compute_max_gap(measurements)
+
+    dist_std = np.std(distances)
+    dist_mean = np.mean(distances)
+    dist_cv = dist_std / dist_mean if dist_mean > 0 else 0
+
+    depth_std = np.std(depths)
+    depth_mean = np.mean(depths)
+    depth_cv = depth_std / depth_mean if depth_mean > 0 else 0
+
+    gap_factor = max(0, 1 - max_gap / 60.0)
+    density_factor = min(1.0, n_points / 36.0)
+    smoothness_factor = max(0, 1 - (dist_cv + depth_cv))
+
+    accuracy_score = (gap_factor * 0.4 + density_factor * 0.3 + smoothness_factor * 0.3) * 100
+
+    if accuracy_score >= 90:
+        estimated_error_pct = 1.0
+        error_level = '极高精度'
+        confidence = '高'
+    elif accuracy_score >= 75:
+        estimated_error_pct = 3.0
+        error_level = '高精度'
+        confidence = '较高'
+    elif accuracy_score >= 60:
+        estimated_error_pct = 6.0
+        error_level = '中等精度'
+        confidence = '中等'
+    elif accuracy_score >= 45:
+        estimated_error_pct = 10.0
+        error_level = '低精度'
+        confidence = '较低'
+    else:
+        estimated_error_pct = 20.0
+        error_level = '极低精度'
+        confidence = '低'
+
+    return {
+        'accuracy_score': float(accuracy_score),
+        'estimated_error_pct': float(estimated_error_pct),
+        'error_level': error_level,
+        'confidence': confidence,
+        'max_gap': float(max_gap),
+        'avg_gap': float(avg_gap),
+        'point_count': n_points,
+        'distance_cv': float(dist_cv),
+        'depth_cv': float(depth_cv),
+        'gap_factor': float(gap_factor),
+        'density_factor': float(density_factor),
+        'smoothness_factor': float(smoothness_factor)
+    }
+
+
+def simulate_resurvey_plans(measurements: List[Dict],
+                            all_batches_measurements: List[List[Dict]] = None,
+                            plan_sizes: List[int] = None) -> Dict:
+    if not measurements:
+        return {
+            'current_status': {},
+            'plans': [],
+            'recommended_plan': None,
+            'comparison_chart_data': {},
+            'path_data': {}
+        }
+
+    if plan_sizes is None:
+        plan_sizes = [3, 6, 9, 12, 18, 24]
+
+    current_quality = evaluate_batch_quality(0, measurements)
+    current_volume = calculate_volume_conical(measurements)
+    current_missing = detect_missing_intervals_quality(measurements)
+    current_anomalies = detect_anomalies(measurements)
+
+    batch_diff_angles = []
+    if all_batches_measurements and len(all_batches_measurements) >= 2:
+        ref = all_batches_measurements[0]
+        for other in all_batches_measurements[1:]:
+            interp = interpolate_to_common_angles(ref, other, num_points=360)
+            if interp['angles']:
+                dist_diff = np.abs(np.array(interp['distances1']) - np.array(interp['distances2']))
+                depth_diff = np.abs(np.array(interp['depths1']) - np.array(interp['depths2']))
+                combined = dist_diff / (np.mean(np.array(interp['distances1'])) + 1e-6) + \
+                           depth_diff / (np.mean(np.array(interp['depths1'])) + 1e-6)
+                threshold = np.mean(combined) + np.std(combined)
+                significant = np.where(combined > threshold)[0]
+                for idx in significant[::10]:
+                    batch_diff_angles.append(float(interp['angles'][idx]))
+
+    anomaly_regions = get_anomaly_regions_from_measurements(measurements)
+
+    actual_max_gap = _compute_max_gap(measurements)
+    current_accuracy = estimate_volume_accuracy(measurements)
+
+    current_status = {
+        'point_count': len(measurements),
+        'volume': current_volume['volume'],
+        'quality_score': current_quality['overall_score'],
+        'grade': current_quality['grade'],
+        'missing_count': current_missing.get('missing_count', 0),
+        'max_gap': actual_max_gap,
+        'anomaly_count': len(current_anomalies),
+        'issue_count': current_quality.get('issue_count', 0),
+        'avg_gap': 360.0 / len(measurements) if measurements else 0,
+        'coverage_ratio': current_quality.get('angle_coverage', {}).get('coverage_ratio', 0),
+        'accuracy_score': current_accuracy['accuracy_score'],
+        'estimated_error_pct': current_accuracy['estimated_error_pct'],
+        'error_level': current_accuracy['error_level'],
+        'confidence': current_accuracy['confidence']
+    }
+
+    plans = []
+    for size in plan_sizes:
+        sup_angles = _generate_supplementary_angles(
+            current_missing.get('missing_intervals', []),
+            anomaly_regions,
+            batch_diff_angles,
+            size,
+            measurements
+        )
+
+        sim_result = _simulate_volume_with_supplements(measurements, sup_angles)
+
+        enhanced_quality = evaluate_batch_quality(0, sim_result['enhanced_measurements'])
+        enhanced_accuracy = estimate_volume_accuracy(sim_result['enhanced_measurements'])
+
+        volume_change = sim_result['volume'] - current_volume['volume']
+        volume_change_pct = (volume_change / current_volume['volume'] * 100) if current_volume['volume'] > 0 else 0
+
+        quality_improvement = enhanced_quality['overall_score'] - current_quality['overall_score']
+        accuracy_improvement = enhanced_accuracy['accuracy_score'] - current_accuracy['accuracy_score']
+        error_reduction_pct = ((current_accuracy['estimated_error_pct'] - enhanced_accuracy['estimated_error_pct']) 
+                               / current_accuracy['estimated_error_pct'] * 100) if current_accuracy['estimated_error_pct'] > 0 else 0
+
+        gap_reduction = sim_result['max_gap_before'] - sim_result['max_gap_after']
+        gap_reduction_pct = (gap_reduction / sim_result['max_gap_before'] * 100) if sim_result['max_gap_before'] > 0 else 0
+
+        high_priority = sum(1 for s in sup_angles if s['priority'] == 'high')
+        medium_priority = sum(1 for s in sup_angles if s['priority'] == 'medium')
+        low_priority = sum(1 for s in sup_angles if s['priority'] == 'low')
+
+        cost_efficiency = quality_improvement / size if size > 0 else 0
+
+        plan = {
+            'plan_name': f'方案{len(plans) + 1}：补测{size}个角度',
+            'num_supplementary': size,
+            'supplementary_details': sup_angles,
+            'high_priority_count': high_priority,
+            'medium_priority_count': medium_priority,
+            'low_priority_count': low_priority,
+            'projected_volume': sim_result['volume'],
+            'volume_change': volume_change,
+            'volume_change_pct': volume_change_pct,
+            'projected_quality_score': enhanced_quality['overall_score'],
+            'projected_grade': enhanced_quality['grade'],
+            'quality_improvement': quality_improvement,
+            'max_gap_before': sim_result['max_gap_before'],
+            'max_gap_after': sim_result['max_gap_after'],
+            'gap_reduction': gap_reduction,
+            'gap_reduction_pct': gap_reduction_pct,
+            'coverage_improvement': sim_result['coverage_ratio_after'] - sim_result['coverage_ratio_before'],
+            'cost_efficiency': cost_efficiency,
+            'total_points_after': sim_result['point_count'],
+            'enhanced_missing_count': enhanced_quality.get('missing_intervals', {}).get('missing_count', 0),
+            'enhanced_anomaly_count': enhanced_quality.get('outlier_detection', {}).get('outlier_count', 0),
+            'enhanced_issue_count': enhanced_quality.get('issue_count', 0),
+            'accuracy_score': enhanced_accuracy['accuracy_score'],
+            'accuracy_improvement': accuracy_improvement,
+            'estimated_error_pct': enhanced_accuracy['estimated_error_pct'],
+            'error_reduction_pct': error_reduction_pct,
+            'error_level': enhanced_accuracy['error_level'],
+            'confidence': enhanced_accuracy['confidence']
+        }
+        plans.append(plan)
+
+    if plans:
+        valid_plans = [p for p in plans if p['quality_improvement'] > 0]
+        if not valid_plans:
+            valid_plans = plans
+
+        best_quality_plan = max(valid_plans, key=lambda p: p['projected_quality_score'])
+        best_efficiency_plan = max(valid_plans, key=lambda p: p['cost_efficiency'])
+
+        quality_threshold = best_quality_plan['projected_quality_score'] * 0.9
+        candidate_plans = [p for p in valid_plans if p['projected_quality_score'] >= quality_threshold]
+        if candidate_plans:
+            recommended = min(candidate_plans, key=lambda p: p['num_supplementary'])
+        else:
+            recommended = best_efficiency_plan
+    else:
+        best_quality_plan = None
+        best_efficiency_plan = None
+        recommended = None
+
+    comparison_chart_data = {
+        'plan_names': [p['plan_name'] for p in plans],
+        'quality_scores': [p['projected_quality_score'] for p in plans],
+        'volume_changes_pct': [p['volume_change_pct'] for p in plans],
+        'gap_reductions_pct': [p['gap_reduction_pct'] for p in plans],
+        'cost_efficiencies': [p['cost_efficiency'] for p in plans],
+        'num_supplementary': [p['num_supplementary'] for p in plans],
+        'current_quality': current_quality['overall_score'],
+        'accuracy_scores': [p['accuracy_score'] for p in plans],
+        'current_accuracy': current_accuracy['accuracy_score'],
+        'error_reductions_pct': [p['error_reduction_pct'] for p in plans],
+        'estimated_errors_pct': [p['estimated_error_pct'] for p in plans],
+        'current_error_pct': current_accuracy['estimated_error_pct']
+    }
+
+    if recommended:
+        path_angles = sorted(recommended['supplementary_details'], key=lambda x: x['angle'])
+        path_data = {
+            'angles': [p['angle'] for p in path_angles],
+            'priorities': [p['priority'] for p in path_angles],
+            'reasons': [p['reason'] for p in path_angles],
+            'sources': [p['source'] for p in path_angles],
+            'weights': [p['weight'] for p in path_angles]
+        }
+    else:
+        path_data = {}
+
+    return {
+        'current_status': current_status,
+        'plans': plans,
+        'recommended_plan': recommended,
+        'best_quality_plan': best_quality_plan,
+        'best_efficiency_plan': best_efficiency_plan,
+        'comparison_chart_data': comparison_chart_data,
+        'path_data': path_data
+    }
+
+
+def get_anomaly_regions_from_measurements(measurements: List[Dict]) -> List[Dict]:
+    if len(measurements) < 3:
+        return []
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    distances = df['distance'].values
+    depths = df['depth'].values
+    angles = df['angle'].values
+
+    regions = []
+
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    if dist_std > 0:
+        dist_zscores = np.abs((distances - dist_mean) / dist_std)
+        in_anomaly = False
+        start_idx = 0
+        for i in range(len(dist_zscores)):
+            if dist_zscores[i] > 2.0 and not in_anomaly:
+                in_anomaly = True
+                start_idx = i
+            elif dist_zscores[i] <= 2.0 and in_anomaly:
+                in_anomaly = False
+                regions.append({
+                    'start_angle': float(angles[start_idx]),
+                    'end_angle': float(angles[i - 1]),
+                    'anomaly_type': '距离异常',
+                    'description': f'距离偏差超过2σ的异常区域'
+                })
+        if in_anomaly:
+            regions.append({
+                'start_angle': float(angles[start_idx]),
+                'end_angle': float(angles[-1]),
+                'anomaly_type': '距离异常',
+                'description': f'距离偏差超过2σ的异常区域'
+            })
+
+    depth_mean = np.mean(depths)
+    depth_std = np.std(depths)
+    if depth_std > 0:
+        depth_zscores = np.abs((depths - depth_mean) / depth_std)
+        in_anomaly = False
+        start_idx = 0
+        for i in range(len(depth_zscores)):
+            if depth_zscores[i] > 2.0 and not in_anomaly:
+                in_anomaly = True
+                start_idx = i
+            elif depth_zscores[i] <= 2.0 and in_anomaly:
+                in_anomaly = False
+                regions.append({
+                    'start_angle': float(angles[start_idx]),
+                    'end_angle': float(angles[i - 1]),
+                    'anomaly_type': '深度异常',
+                    'description': f'深度偏差超过2σ的异常区域'
+                })
+        if in_anomaly:
+            regions.append({
+                'start_angle': float(angles[start_idx]),
+                'end_angle': float(angles[-1]),
+                'anomaly_type': '深度异常',
+                'description': f'深度偏差超过2σ的异常区域'
+            })
+
+    return regions
+
+
+def generate_resurvey_report(cave_name: str, batch_name: str, simulation_result: Dict) -> str:
+    lines = []
+
+    lines.append("=" * 60)
+    lines.append("勘测方案模拟与补测优化报告")
+    lines.append("=" * 60)
+    lines.append("")
+
+    lines.append(f"盐穴名称: {cave_name}")
+    lines.append(f"勘测批次: {batch_name}")
+    lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("一、当前数据状况")
+    lines.append("-" * 60)
+    lines.append("")
+
+    cs = simulation_result.get('current_status', {})
+    lines.append(f"当前测量点数: {cs.get('point_count', 0)}")
+    lines.append(f"当前容积估算: {cs.get('volume', 0):.2f} m³")
+    lines.append(f"当前质量评分: {cs.get('quality_score', 0):.1f} 分")
+    lines.append(f"当前质量等级: {cs.get('grade', '-')}")
+    lines.append(f"容积估算精度: {cs.get('accuracy_score', 0):.1f} 分 ({cs.get('error_level', '-')})")
+    lines.append(f"预计容积误差: ±{cs.get('estimated_error_pct', 0):.1f}%")
+    lines.append(f"置信度: {cs.get('confidence', '-')}")
+    lines.append(f"缺失区间数: {cs.get('missing_count', 0)}")
+    lines.append(f"最大间隔: {cs.get('max_gap', 0):.1f}°")
+    lines.append(f"异常区域数: {cs.get('anomaly_count', 0)}")
+    lines.append(f"问题总数: {cs.get('issue_count', 0)} 项")
+    lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("二、补测方案对比")
+    lines.append("-" * 60)
+    lines.append("")
+
+    for i, plan in enumerate(simulation_result.get('plans', []), 1):
+        lines.append(f"方案{i}：补测 {plan['num_supplementary']} 个角度")
+        lines.append(f"  预计容积: {plan['projected_volume']:.2f} m³ (变化 {plan['volume_change_pct']:+.2f}%)")
+        lines.append(f"  预计质量评分: {plan['projected_quality_score']:.1f} 分 (提升 {plan['quality_improvement']:+.1f})")
+        lines.append(f"  预计质量等级: {plan['projected_grade']}")
+        lines.append(f"  预计容积精度: {plan['accuracy_score']:.1f} 分 (提升 {plan['accuracy_improvement']:+.1f})")
+        lines.append(f"  预计误差率: ±{plan['estimated_error_pct']:.1f}% (缩减 {plan['error_reduction_pct']:.1f}%)")
+        lines.append(f"  最大间隔缩减: {plan['max_gap_before']:.1f}° → {plan['max_gap_after']:.1f}° (缩减 {plan['gap_reduction_pct']:.1f}%)")
+        lines.append(f"  高/中/低优先级点数: {plan['high_priority_count']}/{plan['medium_priority_count']}/{plan['low_priority_count']}")
+        lines.append(f"  成本效率: {plan['cost_efficiency']:.2f} 分/点")
+        lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("三、推荐方案")
+    lines.append("-" * 60)
+    lines.append("")
+
+    recommended = simulation_result.get('recommended_plan')
+    if recommended:
+        lines.append(f"推荐方案: {recommended['plan_name']}")
+        lines.append(f"  补测角度数: {recommended['num_supplementary']}")
+        lines.append(f"  预计质量提升: {recommended['quality_improvement']:+.1f} 分")
+        lines.append(f"  预计容积变化: {recommended['volume_change_pct']:+.2f}%")
+        lines.append(f"  预计精度提升: {recommended['accuracy_improvement']:+.1f} 分")
+        lines.append(f"  预计误差缩减: {recommended['error_reduction_pct']:.1f}%")
+        lines.append(f"  成本效率: {recommended['cost_efficiency']:.2f} 分/点")
+        lines.append("")
+        lines.append("  推荐补测路径（按优先级排序）:")
+        sorted_details = sorted(recommended['supplementary_details'], 
+                               key=lambda x: (0 if x['priority'] == 'high' else (1 if x['priority'] == 'medium' else 2), 
+                                              -x['weight']))
+        for j, detail in enumerate(sorted_details, 1):
+            priority_label = {'high': '高', 'medium': '中', 'low': '低'}.get(detail['priority'], detail['priority'])
+            source_label = {
+                'missing_interval': '缺失区间',
+                'anomaly': '异常区域',
+                'batch_diff': '批次差异',
+                'gap_filling': '大间隔加密',
+                'uniform_density': '均匀加密',
+                'regular': '常规加密'
+            }.get(detail['source'], detail['source'])
+            lines.append(f"    {j}. 角度 {detail['angle']:.1f}° [优先级: {priority_label}] - {detail['reason']} (来源: {source_label})")
+        lines.append("")
+    else:
+        lines.append("暂无推荐方案。")
+        lines.append("")
+
+    lines.append("-" * 60)
+    lines.append("四、补测建议总结")
+    lines.append("-" * 60)
+    lines.append("")
+
+    if recommended:
+        quality_improvement = recommended['accuracy_improvement']
+        if quality_improvement > 15:
+            lines.append("当前容积估算精度存在较大提升空间，强烈建议执行补测方案。")
+        elif quality_improvement > 5:
+            lines.append("当前容积估算精度有一定提升空间，建议执行补测方案。")
+        else:
+            lines.append("当前数据质量较好，补测收益有限，可根据实际需求决定是否补测。")
+        lines.append("")
+        lines.append(f"最优性价比方案: 补测 {recommended['num_supplementary']} 个角度")
+        lines.append(f"预期质量评分从 {cs.get('quality_score', 0):.1f} 提升至 {recommended['projected_quality_score']:.1f}")
+        lines.append(f"预期精度评分从 {cs.get('accuracy_score', 0):.1f} 提升至 {recommended['accuracy_score']:.1f}")
+        lines.append(f"预期容积误差从 ±{cs.get('estimated_error_pct', 0):.1f}% 降至 ±{recommended['estimated_error_pct']:.1f}%")
+        lines.append(f"预期最大间隔从 {cs.get('max_gap', 0):.1f}° 缩减至 {recommended['max_gap_after']:.1f}°")
+    else:
+        lines.append("无需补测，数据质量良好。")
+
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("报告生成完毕")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
