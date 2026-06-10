@@ -59,6 +59,12 @@ sidebar = dbc.Col([
             className="mb-2"
         ),
         dbc.NavLink(
+            [html.I(className="bi bi-check2-circle me-2"), "质量评估中心"],
+            href="/quality-assessment",
+            active="exact",
+            className="mb-2"
+        ),
+        dbc.NavLink(
             [html.I(className="bi bi-gear me-2"), "数据管理"],
             href="/data-management",
             active="exact",

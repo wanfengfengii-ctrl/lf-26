@@ -4,6 +4,7 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from scipy.interpolate import interp1d
 from scipy.integrate import simpson
+from scipy.signal import find_peaks
 
 
 def validate_measurements(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict]]:
@@ -722,6 +723,721 @@ def generate_temporal_analysis_report(cave_name: str, base_batch: Dict, compare_
         else:
             report_lines.append(f"{i + 1}. {name}: {vol:.2f} m³ ({change:+.2f}%)")
     report_lines.append("")
+
+    report_lines.append("=" * 60)
+    report_lines.append("报告生成完毕")
+    report_lines.append("=" * 60)
+
+    return "\n".join(report_lines)
+
+
+def evaluate_angle_coverage(measurements: List[Dict], expected_interval: float = 15.0) -> Dict:
+    if not measurements:
+        return {
+            'score': 0,
+            'coverage_ratio': 0,
+            'covered_degrees': 0,
+            'gaps': [],
+            'gap_count': 0,
+            'issues': []
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+
+    covered_degrees = 0
+    gaps = []
+    issues = []
+
+    for i in range(len(angles)):
+        j = (i + 1) % len(angles)
+        if j == 0:
+            gap = (360 - angles[i]) + angles[j]
+            wraps = True
+        else:
+            gap = angles[j] - angles[i]
+            wraps = False
+
+        if gap > expected_interval * 1.5:
+            gaps.append({
+                'start_angle': float(angles[i]),
+                'end_angle': float(angles[j]),
+                'gap_size': float(gap),
+                'wraps': wraps
+            })
+
+        covered_degrees += min(gap, expected_interval * 2)
+
+    coverage_ratio = min(covered_degrees / 360.0, 1.0)
+
+    if coverage_ratio >= 0.95:
+        score = 100
+    elif coverage_ratio >= 0.85:
+        score = 80
+    elif coverage_ratio >= 0.7:
+        score = 60
+    else:
+        score = 40
+
+    if coverage_ratio < 0.9:
+        issues.append(f'角度覆盖率不足，仅覆盖 {coverage_ratio * 100:.1f}% 的圆周范围')
+
+    return {
+        'score': score,
+        'coverage_ratio': float(coverage_ratio),
+        'covered_degrees': float(min(covered_degrees, 360)),
+        'gaps': gaps,
+        'gap_count': len(gaps),
+        'issues': issues
+    }
+
+
+def detect_outlier_points(measurements: List[Dict], z_threshold: float = 3.0) -> Dict:
+    if len(measurements) < 5:
+        return {
+            'score': 100,
+            'outliers': [],
+            'outlier_count': 0,
+            'distance_outliers': [],
+            'depth_outliers': [],
+            'issues': []
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    depth_mean = np.mean(depths)
+    depth_std = np.std(depths)
+
+    dist_zscores = np.abs((distances - dist_mean) / dist_std) if dist_std > 0 else np.zeros_like(distances)
+    depth_zscores = np.abs((depths - depth_mean) / depth_std) if depth_std > 0 else np.zeros_like(depths)
+
+    dist_outlier_indices = np.where(dist_zscores > z_threshold)[0]
+    depth_outlier_indices = np.where(depth_zscores > z_threshold)[0]
+
+    distance_outliers = []
+    for idx in dist_outlier_indices:
+        distance_outliers.append({
+            'angle': float(df.iloc[idx]['angle']),
+            'distance': float(distances[idx]),
+            'z_score': float(dist_zscores[idx]),
+            'type': 'distance_outlier'
+        })
+
+    depth_outliers = []
+    for idx in depth_outlier_indices:
+        depth_outliers.append({
+            'angle': float(df.iloc[idx]['angle']),
+            'depth': float(depths[idx]),
+            'z_score': float(depth_zscores[idx]),
+            'type': 'depth_outlier'
+        })
+
+    all_outlier_angles = set(dist_outlier_indices) | set(depth_outlier_indices)
+    outlier_count = len(all_outlier_angles)
+    outlier_ratio = outlier_count / len(measurements)
+
+    if outlier_ratio == 0:
+        score = 100
+    elif outlier_ratio < 0.02:
+        score = 85
+    elif outlier_ratio < 0.05:
+        score = 70
+    elif outlier_ratio < 0.1:
+        score = 55
+    else:
+        score = 40
+
+    issues = []
+    if outlier_count > 0:
+        issues.append(f'检测到 {outlier_count} 个异常跳点（占比 {outlier_ratio * 100:.1f}%）')
+
+    return {
+        'score': score,
+        'outliers': distance_outliers + depth_outliers,
+        'outlier_count': outlier_count,
+        'distance_outliers': distance_outliers,
+        'depth_outliers': depth_outliers,
+        'issues': issues
+    }
+
+
+def detect_missing_intervals_quality(measurements: List[Dict], threshold: float = 15.0) -> Dict:
+    if not measurements:
+        return {
+            'score': 0,
+            'missing_intervals': [],
+            'missing_count': 0,
+            'total_missing_degrees': 0,
+            'max_gap_size': 0,
+            'avg_gap_size': 0,
+            'issues': []
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+
+    missing_intervals = []
+    total_missing = 0
+
+    for i in range(len(angles)):
+        j = (i + 1) % len(angles)
+        if j == 0:
+            gap = (360 - angles[i]) + angles[j]
+            wraps = True
+        else:
+            gap = angles[j] - angles[i]
+            wraps = False
+
+        if gap > threshold:
+            missing_intervals.append({
+                'start_angle': float(angles[i]),
+                'end_angle': float(angles[j]),
+                'gap_size': float(gap),
+                'expected_interval': float(threshold),
+                'wraps': wraps
+            })
+            total_missing += gap - threshold
+
+    max_gap = max([m['gap_size'] for m in missing_intervals]) if missing_intervals else 0
+    avg_gap = np.mean([m['gap_size'] for m in missing_intervals]) if missing_intervals else 0
+
+    if len(missing_intervals) == 0:
+        score = 100
+    elif len(missing_intervals) == 1 and max_gap < threshold * 2:
+        score = 80
+    elif len(missing_intervals) <= 3:
+        score = 60
+    else:
+        score = 40
+
+    issues = []
+    if missing_intervals:
+        issues.append(f'存在 {len(missing_intervals)} 个缺失区间，最大间隔 {max_gap:.1f}°')
+
+    return {
+        'score': score,
+        'missing_intervals': missing_intervals,
+        'missing_count': len(missing_intervals),
+        'total_missing_degrees': float(total_missing),
+        'max_gap_size': float(max_gap),
+        'avg_gap_size': float(avg_gap),
+        'issues': issues
+    }
+
+
+def detect_repetitive_patterns(measurements: List[Dict]) -> Dict:
+    if len(measurements) < 10:
+        return {
+            'score': 100,
+            'patterns': [],
+            'pattern_count': 0,
+            'autocorrelation_peaks': [],
+            'issues': []
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    def compute_autocorrelation(data):
+        n = len(data)
+        mean = np.mean(data)
+        var = np.var(data)
+        if var == 0:
+            return np.zeros(n)
+        result = []
+        for lag in range(1, n // 2):
+            cov = np.mean((data[:n - lag] - mean) * (data[lag:] - mean))
+            result.append(cov / var)
+        return np.array(result)
+
+    dist_autocorr = compute_autocorrelation(distances)
+    depth_autocorr = compute_autocorrelation(depths)
+
+    dist_peaks, dist_props = find_peaks(dist_autocorr, height=0.5, distance=3)
+    depth_peaks, depth_props = find_peaks(depth_autocorr, height=0.5, distance=3)
+
+    patterns = []
+    for peak in dist_peaks:
+        patterns.append({
+            'type': 'distance_pattern',
+            'periodicity': int(peak + 1),
+            'correlation_strength': float(dist_autocorr[peak])
+        })
+
+    for peak in depth_peaks:
+        patterns.append({
+            'type': 'depth_pattern',
+            'periodicity': int(peak + 1),
+            'correlation_strength': float(depth_autocorr[peak])
+        })
+
+    strong_patterns = [p for p in patterns if p['correlation_strength'] > 0.7]
+
+    if not strong_patterns:
+        score = 100
+    elif len(strong_patterns) == 1:
+        score = 75
+    else:
+        score = 50
+
+    issues = []
+    if strong_patterns:
+        issues.append(f'检测到 {len(strong_patterns)} 个强重复趋势模式，可能存在设备周期性误差')
+
+    return {
+        'score': score,
+        'patterns': patterns,
+        'pattern_count': len(patterns),
+        'strong_pattern_count': len(strong_patterns),
+        'autocorrelation_peaks': patterns,
+        'issues': issues
+    }
+
+
+def evaluate_volatility(measurements: List[Dict]) -> Dict:
+    if len(measurements) < 5:
+        return {
+            'score': 100,
+            'distance_std': 0,
+            'depth_std': 0,
+            'distance_cv': 0,
+            'depth_cv': 0,
+            'distance_volatility_level': '正常',
+            'depth_volatility_level': '正常',
+            'issues': []
+        }
+
+    df = pd.DataFrame(measurements)
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    dist_cv = dist_std / dist_mean if dist_mean > 0 else 0
+
+    depth_mean = np.mean(depths)
+    depth_std = np.std(depths)
+    depth_cv = depth_std / depth_mean if depth_mean > 0 else 0
+
+    def classify_volatility(cv):
+        if cv < 0.05:
+            return '极低波动'
+        elif cv < 0.1:
+            return '正常'
+        elif cv < 0.2:
+            return '中等波动'
+        elif cv < 0.35:
+            return '高波动'
+        else:
+            return '异常波动'
+
+    dist_level = classify_volatility(dist_cv)
+    depth_level = classify_volatility(depth_cv)
+
+    dist_score = 100 if dist_cv < 0.15 else (80 if dist_cv < 0.25 else (60 if dist_cv < 0.4 else 40))
+    depth_score = 100 if depth_cv < 0.15 else (80 if depth_cv < 0.25 else (60 if depth_cv < 0.4 else 40))
+
+    avg_score = (dist_score + depth_score) / 2
+
+    issues = []
+    if dist_cv >= 0.25:
+        issues.append(f'距离数据波动异常，变异系数 {dist_cv * 100:.1f}%')
+    if depth_cv >= 0.25:
+        issues.append(f'深度数据波动异常，变异系数 {depth_cv * 100:.1f}%')
+
+    return {
+        'score': float(avg_score),
+        'distance_std': float(dist_std),
+        'depth_std': float(depth_std),
+        'distance_cv': float(dist_cv),
+        'depth_cv': float(depth_cv),
+        'distance_volatility_level': dist_level,
+        'depth_volatility_level': depth_level,
+        'distance_mean': float(dist_mean),
+        'depth_mean': float(depth_mean),
+        'issues': issues
+    }
+
+
+def evaluate_batch_consistency(batches_data: List[Dict]) -> Dict:
+    if len(batches_data) < 2:
+        return {
+            'score': 100,
+            'consistency_score': 100,
+            'batch_pairs': [],
+            'volume_variation_cv': 0,
+            'max_depth_variation_cv': 0,
+            'issues': []
+        }
+
+    volumes = [b.get('volume', 0) for b in batches_data]
+    max_depths = [b.get('max_depth', 0) for b in batches_data]
+
+    volume_cv = np.std(volumes) / np.mean(volumes) if np.mean(volumes) > 0 else 0
+    depth_cv = np.std(max_depths) / np.mean(max_depths) if np.mean(max_depths) > 0 else 0
+
+    batch_pairs = []
+    for i in range(len(batches_data)):
+        for j in range(i + 1, len(batches_data)):
+            vol_diff_pct = abs((volumes[j] - volumes[i]) / volumes[i] * 100) if volumes[i] > 0 else 0
+            depth_diff_pct = abs((max_depths[j] - max_depths[i]) / max_depths[i] * 100) if max_depths[i] > 0 else 0
+            pair_score = max(0, 100 - vol_diff_pct - depth_diff_pct)
+
+            batch_pairs.append({
+                'batch1_name': batches_data[i].get('batch_name', f'批次{i + 1}'),
+                'batch2_name': batches_data[j].get('batch_name', f'批次{j + 1}'),
+                'volume_diff_pct': float(vol_diff_pct),
+                'depth_diff_pct': float(depth_diff_pct),
+                'pair_consistency_score': float(pair_score)
+            })
+
+    avg_pair_score = np.mean([p['pair_consistency_score'] for p in batch_pairs]) if batch_pairs else 100
+
+    volume_consistency_score = max(0, 100 - volume_cv * 200)
+    depth_consistency_score = max(0, 100 - depth_cv * 200)
+
+    overall_score = (volume_consistency_score + depth_consistency_score + avg_pair_score) / 3
+
+    issues = []
+    if volume_cv > 0.1:
+        issues.append(f'批次间容积变异度过高（CV={volume_cv * 100:.1f}%），可能存在系统误差')
+    if depth_cv > 0.1:
+        issues.append(f'批次间最大深度变异度过高（CV={depth_cv * 100:.1f}%），建议校准设备')
+
+    return {
+        'score': float(overall_score),
+        'consistency_score': float(overall_score),
+        'batch_pairs': batch_pairs,
+        'volume_variation_cv': float(volume_cv),
+        'max_depth_variation_cv': float(depth_cv),
+        'volume_consistency_score': float(volume_consistency_score),
+        'depth_consistency_score': float(depth_consistency_score),
+        'issues': issues
+    }
+
+
+def generate_quality_heatmap_data(measurements: List[Dict]) -> Dict:
+    if not measurements:
+        return {
+            'angles': [],
+            'quality_scores': [],
+            'distance_deviations': [],
+            'depth_deviations': [],
+            'overall_quality': 0
+        }
+
+    df = pd.DataFrame(measurements).sort_values('angle')
+    angles = df['angle'].values
+    distances = df['distance'].values
+    depths = df['depth'].values
+
+    dist_mean = np.mean(distances)
+    dist_std = np.std(distances)
+    depth_mean = np.mean(depths)
+    depth_std = np.std(depths)
+
+    distance_deviations = []
+    depth_deviations = []
+    quality_scores = []
+
+    for i in range(len(angles)):
+        if dist_std > 0:
+            dist_z = abs((distances[i] - dist_mean) / dist_std)
+        else:
+            dist_z = 0
+
+        if depth_std > 0:
+            depth_z = abs((depths[i] - depth_mean) / depth_std)
+        else:
+            depth_z = 0
+
+        distance_deviations.append(float(dist_z))
+        depth_deviations.append(float(depth_z))
+
+        max_z = max(dist_z, depth_z)
+        if max_z < 1:
+            quality = 100
+        elif max_z < 2:
+            quality = 80
+        elif max_z < 3:
+            quality = 60
+        else:
+            quality = 40
+
+        quality_scores.append(float(quality))
+
+    overall_quality = float(np.mean(quality_scores))
+
+    return {
+        'angles': angles.tolist(),
+        'quality_scores': quality_scores,
+        'distance_deviations': distance_deviations,
+        'depth_deviations': depth_deviations,
+        'overall_quality': overall_quality,
+        'distance_mean': float(dist_mean),
+        'distance_std': float(dist_std),
+        'depth_mean': float(depth_mean),
+        'depth_std': float(depth_std)
+    }
+
+
+def generate_repair_suggestions(quality_result: Dict) -> List[Dict]:
+    suggestions = []
+
+    angle_cov = quality_result.get('angle_coverage', {})
+    if angle_cov.get('score', 100) < 80:
+        gaps = angle_cov.get('gaps', [])
+        for gap in gaps[:3]:
+            suggestions.append({
+                'type': '补测',
+                'severity': '高',
+                'category': '角度覆盖',
+                'description': f'在 {gap["start_angle"]:.1f}° - {gap["end_angle"]:.1f}° 区间存在 {gap["gap_size"]:.1f}° 的测量空白，建议补充测量',
+                'action': '补测角区'
+            })
+
+    outliers = quality_result.get('outlier_detection', {})
+    if outliers.get('outlier_count', 0) > 0:
+        suggestions.append({
+            'type': '数据修正',
+            'severity': '中',
+            'category': '异常点',
+            'description': f'检测到 {outliers["outlier_count"]} 个异常跳点，建议复核或剔除这些数据点',
+            'action': '剔除异常点'
+        })
+
+    missing = quality_result.get('missing_intervals', {})
+    if missing.get('missing_count', 0) > 0:
+        suggestions.append({
+            'type': '补测',
+            'severity': '中',
+            'category': '缺失区间',
+            'description': f'存在 {missing["missing_count"]} 个数据缺失区间，建议加密测量点',
+            'action': '补测角区'
+        })
+
+    patterns = quality_result.get('repetitive_patterns', {})
+    if patterns.get('strong_pattern_count', 0) > 0:
+        suggestions.append({
+            'type': '设备校准',
+            'severity': '中',
+            'category': '重复趋势',
+            'description': '检测到周期性重复模式，可能存在仪器系统误差，建议校准设备',
+            'action': '重新校准批次'
+        })
+
+    volatility = quality_result.get('volatility', {})
+    if volatility.get('score', 100) < 70:
+        suggestions.append({
+            'type': '设备检查',
+            'severity': '高',
+            'category': '波动异常',
+            'description': f'数据波动异常（距离CV={volatility.get("distance_cv", 0) * 100:.1f}%，'
+                         f'深度CV={volatility.get("depth_cv", 0) * 100:.1f}%），建议检查测量设备',
+            'action': '重新校准批次'
+        })
+
+    consistency = quality_result.get('batch_consistency', {})
+    if consistency.get('score', 100) < 70:
+        suggestions.append({
+            'type': '批次校准',
+            'severity': '高',
+            'category': '批次一致性',
+            'description': '批次间数据一致性较差，建议统一校准基准或复核测量流程',
+            'action': '重新校准批次'
+        })
+
+    if not suggestions:
+        suggestions.append({
+            'type': '正常',
+            'severity': '低',
+            'category': '数据质量',
+            'description': '数据质量良好，暂无修复建议',
+            'action': '保持现状'
+        })
+
+    return suggestions
+
+
+def evaluate_batch_quality(batch_id: int, measurements: List[Dict],
+                           all_batches_stats: List[Dict] = None) -> Dict:
+    if not measurements:
+        return {
+            'batch_id': batch_id,
+            'overall_score': 0,
+            'grade': '无数据',
+            'angle_coverage': {},
+            'outlier_detection': {},
+            'missing_intervals': {},
+            'repetitive_patterns': {},
+            'volatility': {},
+            'batch_consistency': {},
+            'heatmap_data': {},
+            'repair_suggestions': [],
+            'all_issues': []
+        }
+
+    angle_cov = evaluate_angle_coverage(measurements)
+    outliers = detect_outlier_points(measurements)
+    missing = detect_missing_intervals_quality(measurements)
+    patterns = detect_repetitive_patterns(measurements)
+    volatility = evaluate_volatility(measurements)
+
+    if all_batches_stats and len(all_batches_stats) >= 2:
+        consistency = evaluate_batch_consistency(all_batches_stats)
+    else:
+        consistency = {
+            'score': 85,
+            'consistency_score': 85,
+            'issues': ['批次数量不足，无法评估批次间一致性']
+        }
+
+    weights = {
+        'angle_coverage': 0.2,
+        'outlier_detection': 0.2,
+        'missing_intervals': 0.15,
+        'repetitive_patterns': 0.15,
+        'volatility': 0.15,
+        'batch_consistency': 0.15
+    }
+
+    overall_score = (
+        angle_cov['score'] * weights['angle_coverage'] +
+        outliers['score'] * weights['outlier_detection'] +
+        missing['score'] * weights['missing_intervals'] +
+        patterns['score'] * weights['repetitive_patterns'] +
+        volatility['score'] * weights['volatility'] +
+        consistency['score'] * weights['batch_consistency']
+    )
+
+    if overall_score >= 90:
+        grade = '优秀'
+    elif overall_score >= 75:
+        grade = '良好'
+    elif overall_score >= 60:
+        grade = '合格'
+    elif overall_score >= 45:
+        grade = '较差'
+    else:
+        grade = '不合格'
+
+    heatmap_data = generate_quality_heatmap_data(measurements)
+
+    quality_result = {
+        'angle_coverage': angle_cov,
+        'outlier_detection': outliers,
+        'missing_intervals': missing,
+        'repetitive_patterns': patterns,
+        'volatility': volatility,
+        'batch_consistency': consistency
+    }
+
+    repair_suggestions = generate_repair_suggestions(quality_result)
+
+    all_issues = []
+    for key, value in quality_result.items():
+        all_issues.extend(value.get('issues', []))
+
+    return {
+        'batch_id': batch_id,
+        'overall_score': float(overall_score),
+        'grade': grade,
+        'angle_coverage': angle_cov,
+        'outlier_detection': outliers,
+        'missing_intervals': missing,
+        'repetitive_patterns': patterns,
+        'volatility': volatility,
+        'batch_consistency': consistency,
+        'heatmap_data': heatmap_data,
+        'repair_suggestions': repair_suggestions,
+        'all_issues': all_issues,
+        'issue_count': len(all_issues)
+    }
+
+
+def generate_quality_report(cave_name: str, batch_name: str, quality_result: Dict) -> str:
+    report_lines = []
+
+    report_lines.append("=" * 60)
+    report_lines.append("勘测数据质量评估报告")
+    report_lines.append("=" * 60)
+    report_lines.append("")
+
+    report_lines.append(f"盐穴名称: {cave_name}")
+    report_lines.append(f"勘测批次: {batch_name}")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("一、综合质量评分")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+    report_lines.append(f"综合质量评分: {quality_result['overall_score']:.1f} / 100")
+    report_lines.append(f"质量等级: {quality_result['grade']}")
+    report_lines.append(f"发现问题数: {quality_result.get('issue_count', 0)} 项")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("二、分项评估")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    report_lines.append(f"1. 角度覆盖率: {quality_result['angle_coverage']['score']} 分")
+    report_lines.append(f"   覆盖比例: {quality_result['angle_coverage'].get('coverage_ratio', 0) * 100:.1f}%")
+    report_lines.append(f"   缺失区间数: {quality_result['angle_coverage'].get('gap_count', 0)}")
+    report_lines.append("")
+
+    report_lines.append(f"2. 异常跳点检测: {quality_result['outlier_detection']['score']} 分")
+    report_lines.append(f"   异常点数量: {quality_result['outlier_detection'].get('outlier_count', 0)}")
+    report_lines.append("")
+
+    report_lines.append(f"3. 缺失区间检测: {quality_result['missing_intervals']['score']} 分")
+    report_lines.append(f"   缺失区间数: {quality_result['missing_intervals'].get('missing_count', 0)}")
+    report_lines.append(f"   最大间隔: {quality_result['missing_intervals'].get('max_gap_size', 0):.1f}°")
+    report_lines.append("")
+
+    report_lines.append(f"4. 重复趋势检测: {quality_result['repetitive_patterns']['score']} 分")
+    report_lines.append(f"   检测模式数: {quality_result['repetitive_patterns'].get('pattern_count', 0)}")
+    report_lines.append("")
+
+    report_lines.append(f"5. 数据波动性: {quality_result['volatility']['score']} 分")
+    report_lines.append(f"   距离变异系数: {quality_result['volatility'].get('distance_cv', 0) * 100:.2f}%")
+    report_lines.append(f"   深度变异系数: {quality_result['volatility'].get('depth_cv', 0) * 100:.2f}%")
+    report_lines.append(f"   距离波动等级: {quality_result['volatility'].get('distance_volatility_level', '-')}")
+    report_lines.append(f"   深度波动等级: {quality_result['volatility'].get('depth_volatility_level', '-')}")
+    report_lines.append("")
+
+    report_lines.append(f"6. 批次间一致性: {quality_result['batch_consistency']['score']:.1f} 分")
+    report_lines.append(f"   容积变异系数: {quality_result['batch_consistency'].get('volume_variation_cv', 0) * 100:.2f}%")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("三、问题明细")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    all_issues = quality_result.get('all_issues', [])
+    if all_issues:
+        for i, issue in enumerate(all_issues, 1):
+            report_lines.append(f"{i}. {issue}")
+    else:
+        report_lines.append("未发现明显数据质量问题。")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("四、修复建议")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    suggestions = quality_result.get('repair_suggestions', [])
+    for i, suggestion in enumerate(suggestions, 1):
+        report_lines.append(f"{i}. [{suggestion['severity']}] {suggestion['category']} - {suggestion['action']}")
+        report_lines.append(f"   说明: {suggestion['description']}")
+        report_lines.append("")
 
     report_lines.append("=" * 60)
     report_lines.append("报告生成完毕")
