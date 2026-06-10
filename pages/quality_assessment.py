@@ -178,10 +178,22 @@ def update_quality_overview(batch_id, cave_id):
     measurements = get_measurements_by_batch(batch_id)
     if not measurements:
         return (
-            html.H2('0', className='text-muted'),
-            html.H2('无数据', className='text-muted'),
-            html.H2('--', className='text-muted'),
-            html.H2('0', className='text-muted'),
+            html.Div([
+                html.H2('0', className='text-muted'),
+                html.Small('请先导入数据', className='text-muted')
+            ]),
+            html.Div([
+                html.H2('无数据', className='text-muted'),
+                html.Small('无法评估', className='text-muted')
+            ]),
+            html.Div([
+                html.H2('--', className='text-muted'),
+                html.Small('', className='text-muted')
+            ]),
+            html.Div([
+                html.H2('0', className='text-muted'),
+                html.Small('个测量点', className='text-muted')
+            ]),
             {}, '', ''
         )
 
@@ -247,7 +259,35 @@ def update_quality_overview(batch_id, cave_id):
 )
 def render_tab_content(active_tab, quality_result, batch_id):
     if not quality_result or not quality_result.get('heatmap_data'):
-        return html.P('请选择一个有数据的批次以查看质量评估结果')
+        return dbc.Container([
+            dbc.Row([
+                dbc.Col([
+                    html.Div([
+                        html.I(className='bi bi-inbox', style={'fontSize': '3rem', 'color': '#6c757d'}),
+                        html.H5('当前批次暂无测量数据', className='mt-3 mb-2 text-muted'),
+                        html.P('无法进行数据质量评估，请先为该批次导入测量数据。', className='text-muted'),
+                        html.Hr(className='my-3'),
+                        html.H6('你可以执行以下操作：', className='mb-3'),
+                        dbc.ListGroup([
+                            dbc.ListGroupItem([
+                                html.I(className='bi bi-upload me-2'),
+                                html.A('前往数据导入页面', href='/', className='text-decoration-none'),
+                                ' — 导入 CSV 格式的勘测数据'
+                            ]),
+                            dbc.ListGroupItem([
+                                html.I(className='bi bi-plus-circle me-2'),
+                                html.A('前往数据管理页面', href='/data-management', className='text-decoration-none'),
+                                ' — 手动添加测量记录'
+                            ]),
+                            dbc.ListGroupItem([
+                                html.I(className='bi bi-arrow-repeat me-2'),
+                                '选择其他已有数据的批次进行评估'
+                            ]),
+                        ]),
+                    ], className='text-center p-4')
+                ], width=8, className='mx-auto')
+            ])
+        ])
 
     if active_tab == 'heatmap-tab':
         return render_heatmap_tab(quality_result)
@@ -271,80 +311,201 @@ def render_heatmap_tab(quality_result):
     if not angles:
         return html.P('暂无数据')
 
+    angles_arr = np.array(angles)
+    scores_arr = np.array(quality_scores)
+    dist_dev_arr = np.array(distance_deviations)
+    depth_dev_arr = np.array(depth_deviations)
+
+    sort_idx = np.argsort(angles_arr)
+    angles_sorted = angles_arr[sort_idx]
+    scores_sorted = scores_arr[sort_idx]
+    dist_dev_sorted = dist_dev_arr[sort_idx]
+    depth_dev_sorted = depth_dev_arr[sort_idx]
+
+    angles_rad = np.deg2rad(angles_sorted)
+    dist_mean = heatmap_data.get('distance_mean', 50)
+    dist_std = heatmap_data.get('distance_std', 5)
+    depth_mean = heatmap_data.get('depth_mean', 30)
+
+    n_interp = 360
+    interp_angles = np.linspace(0, 360, n_interp, endpoint=False)
+    interp_angles_rad = np.deg2rad(interp_angles)
+
+    angles_ext = np.concatenate([angles_sorted - 360, angles_sorted, angles_sorted + 360])
+    scores_ext = np.concatenate([scores_sorted, scores_sorted, scores_sorted])
+    dist_dev_ext = np.concatenate([dist_dev_sorted, dist_dev_sorted, dist_dev_sorted])
+    depth_dev_ext = np.concatenate([depth_dev_sorted, depth_dev_sorted, depth_dev_sorted])
+
+    from scipy.interpolate import interp1d
+    f_scores = interp1d(angles_ext, scores_ext, kind='linear')
+    f_dist_dev = interp1d(angles_ext, dist_dev_ext, kind='linear')
+    f_depth_dev = interp1d(angles_ext, depth_dev_ext, kind='linear')
+
+    interp_scores = f_scores(interp_angles)
+    interp_dist_dev = f_dist_dev(interp_angles)
+    interp_depth_dev = f_depth_dev(interp_angles)
+
+    n_rings = 5
+    r_values = np.linspace(dist_mean - 2 * dist_std, dist_mean + 2 * dist_std, n_rings)
+
+    r_grid, theta_grid = np.meshgrid(r_values, interp_angles_rad)
+    score_grid = np.tile(interp_scores.reshape(-1, 1), (1, n_rings))
+
+    for j in range(n_rings):
+        ring_weight = 1.0 - 0.15 * abs(j - n_rings // 2) / (n_rings // 2)
+        score_grid[:, j] *= ring_weight
+
     fig = go.Figure()
 
-    fig.add_trace(go.Barpolar(
-        r=quality_scores,
-        theta=angles,
-        width=[360 / len(angles)] * len(angles),
-        marker=dict(
-            color=quality_scores,
-            colorscale=[
-                [0, 'red'],
-                [0.4, 'orange'],
-                [0.6, 'yellow'],
-                [0.8, 'lightgreen'],
-                [1, 'green']
-            ],
-            cmin=0,
-            cmax=100,
-            colorbar=dict(title='质量分数')
+    fig.add_trace(go.Heatmap(
+        z=score_grid.T,
+        x=np.rad2deg(theta_grid[:, 0]),
+        y=r_grid[0, :],
+        colorscale=[
+            [0, '#d73027'],
+            [0.25, '#fc8d59'],
+            [0.5, '#fee08b'],
+            [0.75, '#91cf60'],
+            [1, '#1a9850']
+        ],
+        zmin=0,
+        zmax=100,
+        colorbar=dict(
+            title=dict(text='质量分数', side='right'),
+            thickness=15,
+            len=0.8
         ),
-        name='质量评分',
-        hovertemplate='角度: %{theta}°<br>质量评分: %{r:.1f}<extra></extra>'
+        hovertemplate='角度: %{x:.1f}°<br>距离: %{y:.1f} m<br>质量: %{z:.1f}<extra></extra>',
+        name='质量分布'
     ))
 
-    fig.update_layout(
-        title='数据质量热力图（极坐标）',
-        polar=dict(
-            radialaxis=dict(range=[0, 100], title='质量评分'),
-            angularaxis=dict(direction='clockwise', rotation=90)
+    r_meas = dist_mean * np.ones_like(angles_rad)
+    x_meas = r_meas * np.cos(angles_rad)
+    y_meas = r_meas * np.sin(angles_rad)
+
+    marker_colors = [
+        '#1a9850' if s >= 80 else ('#91cf60' if s >= 60 else ('#fee08b' if s >= 40 else '#d73027'))
+        for s in scores_sorted
+    ]
+
+    fig.add_trace(go.Scatterpolar(
+        r=r_meas,
+        theta=angles_sorted,
+        mode='markers',
+        marker=dict(
+            size=10,
+            color=marker_colors,
+            line=dict(color='white', width=1.5)
         ),
-        height=500
+        customdata=scores_sorted,
+        hovertemplate='角度: %{theta:.1f}°<br>质量: %{customdata:.1f}<extra></extra>',
+        name='测量点'
+    ))
+
+    for angle_val, score_val in zip(angles_sorted, scores_sorted):
+        if score_val < 60:
+            fig.add_trace(go.Scatterpolar(
+                r=[dist_mean * 0.6, dist_mean * 1.4],
+                theta=[angle_val, angle_val],
+                mode='lines',
+                line=dict(color='rgba(215, 48, 39, 0.3)', width=2, dash='dot'),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+
+    fig.update_layout(
+        title='空间质量分布热力图',
+        polar=dict(
+            radialaxis=dict(
+                range=[dist_mean - 2.5 * dist_std, dist_mean + 2.5 * dist_std],
+                title='距离 (m)',
+                showgrid=True
+            ),
+            angularaxis=dict(
+                direction='clockwise',
+                rotation=90,
+                showgrid=True
+            )
+        ),
+        height=550,
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=-0.1,
+            xanchor='center',
+            x=0.5
+        )
     )
 
     fig2 = go.Figure()
 
     fig2.add_trace(go.Scatter(
-        x=angles,
-        y=distance_deviations,
-        mode='lines+markers',
+        x=interp_angles,
+        y=interp_dist_dev,
+        mode='lines',
         name='距离偏差 (Z分数)',
-        line=dict(color='blue', width=2),
-        marker=dict(size=6)
+        line=dict(color='rgba(55, 83, 109, 0.6)', width=1.5),
+        fill='tozeroy',
+        fillcolor='rgba(55, 83, 109, 0.08)'
     ))
 
     fig2.add_trace(go.Scatter(
-        x=angles,
-        y=depth_deviations,
-        mode='lines+markers',
+        x=interp_angles,
+        y=interp_depth_dev,
+        mode='lines',
         name='深度偏差 (Z分数)',
-        line=dict(color='red', width=2),
-        marker=dict(size=6)
+        line=dict(color='rgba(215, 48, 39, 0.6)', width=1.5),
+        fill='tozeroy',
+        fillcolor='rgba(215, 48, 39, 0.08)'
     ))
 
-    fig2.add_hline(y=1, line_dash='dash', line_color='orange', annotation_text='1σ')
-    fig2.add_hline(y=2, line_dash='dash', line_color='red', annotation_text='2σ')
-    fig2.add_hline(y=3, line_dash='dash', line_color='darkred', annotation_text='3σ')
+    fig2.add_trace(go.Scatter(
+        x=angles_sorted,
+        y=dist_dev_sorted,
+        mode='markers',
+        name='距离实测点',
+        marker=dict(color='#375577', size=7, line=dict(color='white', width=1)),
+        hovertemplate='角度: %{x:.1f}°<br>Z分数: %{y:.2f}<extra></extra>'
+    ))
+
+    fig2.add_trace(go.Scatter(
+        x=angles_sorted,
+        y=depth_dev_sorted,
+        mode='markers',
+        name='深度实测点',
+        marker=dict(color='#d73027', size=7, line=dict(color='white', width=1)),
+        hovertemplate='角度: %{x:.1f}°<br>Z分数: %{y:.2f}<extra></extra>'
+    ))
+
+    fig2.add_hline(y=1, line_dash='dash', line_color='#fc8d59', annotation_text='1σ')
+    fig2.add_hline(y=2, line_dash='dash', line_color='#d73027', annotation_text='2σ')
+    fig2.add_hline(y=3, line_dash='dash', line_color='#a50026', annotation_text='3σ')
 
     fig2.update_layout(
-        title='各角度数据偏差分布',
-        xaxis=dict(title='角度 (°)'),
+        title='各角度数据偏差分布（连续插值 + 实测点）',
+        xaxis=dict(title='角度 (°)', range=[0, 360]),
         yaxis=dict(title='Z 分数'),
         height=400,
-        legend=dict(orientation='h', yanchor='bottom', y=-0.2, xanchor='right', x=1)
+        legend=dict(orientation='h', yanchor='bottom', y=-0.25, xanchor='right', x=1)
     )
+
+    low_quality_angles = angles_sorted[scores_sorted < 60]
+    low_quality_info = ''
+    if len(low_quality_angles) > 0:
+        low_quality_info = f" 低质量区域（<60分）集中在: {', '.join([f'{a:.0f}°' for a in low_quality_angles])}。"
 
     return html.Div([
         dcc.Graph(figure=fig),
         html.Hr(),
         dcc.Graph(figure=fig2),
-        dbc.Alert(
-            "热力图颜色越绿表示数据质量越好，越红表示数据质量越差。"
-            "Z分数越高表示该点与平均值偏差越大，越可能是异常点。",
-            color="info",
-            className="mt-3"
-        )
+        dbc.Alert([
+            html.Strong('图表解读：'),
+            "上方热力图以盐穴截面为底图，颜色表示各角度区域的数据质量——",
+            html.Strong('绿色'), "= 高质量、", html.Strong('黄色'), "= 一般、",
+            html.Strong('红色'), "= 低质量；", "白色圆点为实际测量点位置，红色虚线标记低质量角区。",
+            low_quality_info,
+            " 下方曲线为距离/深度偏差的连续分布，圆点为实测值，水平虚线为σ阈值。"
+        ], color="info", className="mt-3")
     ])
 
 
@@ -451,6 +612,37 @@ def render_subscores_tab(quality_result):
         ])
     ], className='mb-3'))
 
+    missing = quality_result.get('missing_intervals', {})
+    detail_cards.append(dbc.Card([
+        dbc.CardHeader('缺失区间检测详情'),
+        dbc.CardBody([
+            html.P(f"缺失区间数: {missing.get('missing_count', 0)}"),
+            html.P(f"最大间隔: {missing.get('max_gap_size', 0):.1f}°"),
+            html.P(f"平均间隔: {missing.get('avg_gap_size', 0):.1f}°"),
+            html.P(f"总缺失角度: {missing.get('total_missing_degrees', 0):.1f}°"),
+        ])
+    ], className='mb-3'))
+
+    patterns = quality_result.get('repetitive_patterns', {})
+    pattern_list = patterns.get('autocorrelation_peaks', [])
+    pattern_detail = ''
+    if pattern_list:
+        pattern_lines = []
+        for p in pattern_list[:3]:
+            ptype = '距离' if p['type'] == 'distance_pattern' else '深度'
+            pattern_lines.append(f"{ptype}周期={p['periodicity']}点, 强度={p['correlation_strength']:.2f}")
+        pattern_detail = '; '.join(pattern_lines)
+    else:
+        pattern_detail = '无显著周期模式'
+    detail_cards.append(dbc.Card([
+        dbc.CardHeader('重复趋势检测详情'),
+        dbc.CardBody([
+            html.P(f"检测模式数: {patterns.get('pattern_count', 0)}"),
+            html.P(f"强相关模式: {patterns.get('strong_pattern_count', 0)}"),
+            html.P(f"模式详情: {pattern_detail}"),
+        ])
+    ], className='mb-3'))
+
     volatility = quality_result.get('volatility', {})
     detail_cards.append(dbc.Card([
         dbc.CardHeader('数据波动性详情'),
@@ -467,6 +659,31 @@ def render_subscores_tab(quality_result):
         ])
     ], className='mb-3'))
 
+    consistency = quality_result.get('batch_consistency', {})
+    pair_info = ''
+    batch_pairs = consistency.get('batch_pairs', [])
+    if batch_pairs:
+        pair_lines = []
+        for bp in batch_pairs[:3]:
+            pair_lines.append(
+                f"{bp['batch1_name']} vs {bp['batch2_name']}: "
+                f"容积差{bp['volume_diff_pct']:.1f}%, 深度差{bp['depth_diff_pct']:.1f}%"
+            )
+        pair_info = '; '.join(pair_lines)
+    else:
+        pair_info = '批次数量不足，无法对比'
+    detail_cards.append(dbc.Card([
+        dbc.CardHeader('批次间一致性详情'),
+        dbc.CardBody([
+            html.P(f"容积变异系数: {consistency.get('volume_variation_cv', 0) * 100:.2f}%"),
+            html.P(f"深度变异系数: {consistency.get('max_depth_variation_cv', 0) * 100:.2f}%"),
+            html.P(f"容积一致性: {consistency.get('volume_consistency_score', 100):.1f}分"),
+            html.P(f"深度一致性: {consistency.get('depth_consistency_score', 100):.1f}分"),
+            html.Hr(),
+            html.P(f"批次对比: {pair_info}"),
+        ])
+    ], className='mb-3'))
+
     return html.Div([
         dcc.Graph(figure=fig),
         html.Hr(),
@@ -478,7 +695,12 @@ def render_subscores_tab(quality_result):
             dbc.Col(detail_cards[0], width=4),
             dbc.Col(detail_cards[1], width=4),
             dbc.Col(detail_cards[2], width=4),
-        ])
+        ], className='mb-3'),
+        dbc.Row([
+            dbc.Col(detail_cards[3], width=4),
+            dbc.Col(detail_cards[4], width=4),
+            dbc.Col(detail_cards[5], width=4),
+        ]),
     ])
 
 
