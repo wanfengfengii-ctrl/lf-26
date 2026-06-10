@@ -79,6 +79,7 @@ content = dbc.Col([
 
 app.layout = dbc.Container([
     dcc.Location(id='url', refresh=False),
+    dcc.Store(id='selected-cave-store', storage_type='session'),
     dbc.Row([
         sidebar,
         content
@@ -89,12 +90,45 @@ app.layout = dbc.Container([
 @callback(
     Output('sidebar-cave-selector', 'options'),
     Output('sidebar-cave-selector', 'value'),
-    Input('url', 'pathname')
+    Output('selected-cave-store', 'data'),
+    Input('url', 'pathname'),
+    State('selected-cave-store', 'data')
 )
-def update_sidebar_cave_selector(pathname):
+def update_sidebar_cave_selector(pathname, stored_cave_id):
     caves = get_all_caves()
     options = [{'label': c['name'], 'value': c['id']} for c in caves]
-    return options, options[0]['value'] if options else None
+
+    if stored_cave_id:
+        valid_ids = [opt['value'] for opt in options]
+        if stored_cave_id in valid_ids:
+            return options, stored_cave_id, stored_cave_id
+
+    default_value = options[0]['value'] if options else None
+    return options, default_value, default_value
+
+
+@callback(
+    Output('sidebar-cave-selector', 'value', allow_duplicate=True),
+    Input('selected-cave-store', 'data'),
+    State('sidebar-cave-selector', 'value'),
+    prevent_initial_call=True
+)
+def sync_sidebar_from_store(stored_cave_id, current_value):
+    if stored_cave_id != current_value:
+        return stored_cave_id
+    return dash.no_update
+
+
+@callback(
+    Output('selected-cave-store', 'data', allow_duplicate=True),
+    Input('sidebar-cave-selector', 'value'),
+    State('selected-cave-store', 'data'),
+    prevent_initial_call=True
+)
+def sync_sidebar_to_store(cave_id, stored_cave_id):
+    if cave_id != stored_cave_id:
+        return cave_id
+    return dash.no_update
 
 
 @server.route('/download/sample')

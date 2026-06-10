@@ -2,7 +2,7 @@ import dash
 import math
 import numpy as np
 import pandas as pd
-from dash import dcc, html, Input, Output, callback, dash_table
+from dash import dcc, html, Input, Output, State, callback, dash_table, ctx
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import plotly.express as px
@@ -97,6 +97,37 @@ def layout():
             dbc.CardBody(id='cs-anomalies-card')
         ]),
     ], fluid=True)
+
+
+@callback(
+    Output('cs-cave-selector', 'options'),
+    Output('cs-cave-selector', 'value'),
+    Input('selected-cave-store', 'data'),
+    State('cs-cave-selector', 'value'),
+    prevent_initial_call=False
+)
+def sync_cave_selector(stored_cave_id, current_value):
+    caves = get_all_caves()
+    options = [{'label': c['name'], 'value': c['id']} for c in caves]
+
+    if stored_cave_id:
+        valid_ids = [opt['value'] for opt in options]
+        if stored_cave_id in valid_ids:
+            return options, stored_cave_id
+
+    return options, current_value
+
+
+@callback(
+    Output('selected-cave-store', 'data', allow_duplicate=True),
+    Input('cs-cave-selector', 'value'),
+    State('selected-cave-store', 'data'),
+    prevent_initial_call=True
+)
+def sync_cs_to_store(cave_id, stored_cave_id):
+    if cave_id != stored_cave_id:
+        return cave_id
+    return dash.no_update
 
 
 @callback(

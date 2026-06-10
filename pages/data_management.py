@@ -540,3 +540,69 @@ def confirm_delete(confirm_clicks, delete_id, delete_type, cave_id):
         })
 
     return False, table_data, result_msg
+
+
+@callback(
+    Output('mgmt-cave-selector', 'options'),
+    Output('mgmt-cave-selector', 'value'),
+    Input('selected-cave-store', 'data'),
+    Input('mgmt-tabs', 'active_tab'),
+    State('mgmt-cave-selector', 'value'),
+    prevent_initial_call=False
+)
+def sync_mgmt_cave_selector(stored_cave_id, active_tab, current_value):
+    if active_tab != 'measurements-tab':
+        return dash.no_update, dash.no_update
+
+    caves = get_all_caves()
+    options = [{'label': c['name'], 'value': c['id']} for c in caves]
+
+    if stored_cave_id:
+        valid_ids = [opt['value'] for opt in options]
+        if stored_cave_id in valid_ids:
+            return options, stored_cave_id
+
+    return options, current_value
+
+
+@callback(
+    Output('mgmt-batch-cave-selector', 'options'),
+    Output('mgmt-batch-cave-selector', 'value'),
+    Input('selected-cave-store', 'data'),
+    Input('mgmt-tabs', 'active_tab'),
+    State('mgmt-batch-cave-selector', 'value'),
+    prevent_initial_call=False
+)
+def sync_mgmt_batch_cave_selector(stored_cave_id, active_tab, current_value):
+    if active_tab != 'batches-tab':
+        return dash.no_update, dash.no_update
+
+    caves = get_all_caves()
+    options = [{'label': c['name'], 'value': c['id']} for c in caves]
+
+    if stored_cave_id:
+        valid_ids = [opt['value'] for opt in options]
+        if stored_cave_id in valid_ids:
+            return options, stored_cave_id
+
+    return options, current_value
+
+
+@callback(
+    Output('selected-cave-store', 'data', allow_duplicate=True),
+    Input('mgmt-cave-selector', 'value'),
+    Input('mgmt-batch-cave-selector', 'value'),
+    State('selected-cave-store', 'data'),
+    prevent_initial_call=True
+)
+def sync_mgmt_to_store(mgmt_cave_id, mgmt_batch_cave_id, stored_cave_id):
+    triggered = ctx.triggered_id
+
+    if triggered == 'mgmt-cave-selector' and mgmt_cave_id is not None:
+        if mgmt_cave_id != stored_cave_id:
+            return mgmt_cave_id
+    elif triggered == 'mgmt-batch-cave-selector' and mgmt_batch_cave_id is not None:
+        if mgmt_batch_cave_id != stored_cave_id:
+            return mgmt_batch_cave_id
+
+    return dash.no_update
