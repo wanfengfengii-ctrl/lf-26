@@ -53,6 +53,12 @@ sidebar = dbc.Col([
             className="mb-2"
         ),
         dbc.NavLink(
+            [html.I(className="bi bi-graph-up-arrow me-2"), "时序演化分析"],
+            href="/temporal-analysis",
+            active="exact",
+            className="mb-2"
+        ),
+        dbc.NavLink(
             [html.I(className="bi bi-gear me-2"), "数据管理"],
             href="/data-management",
             active="exact",

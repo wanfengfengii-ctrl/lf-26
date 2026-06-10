@@ -346,3 +346,385 @@ def generate_3d_point_cloud(measurements: List[Dict]) -> Dict:
         'distances': df['distance'].values.tolist(),
         'depths': df['depth'].values.tolist()
     }
+
+
+def interpolate_to_common_angles(measurements1: List[Dict], measurements2: List[Dict],
+                                 num_points: int = 360) -> Dict:
+    if not measurements1 or not measurements2:
+        return {'angles': [], 'distances1': [], 'distances2': [], 'depths1': [], 'depths2': []}
+
+    df1 = pd.DataFrame(measurements1).sort_values('angle')
+    df2 = pd.DataFrame(measurements2).sort_values('angle')
+
+    angles1 = df1['angle'].values
+    distances1 = df1['distance'].values
+    depths1 = df1['depth'].values
+
+    angles2 = df2['angle'].values
+    distances2 = df2['distance'].values
+    depths2 = df2['depth'].values
+
+    common_angles = np.linspace(0, 360, num_points, endpoint=False)
+
+    angles1_ext = np.concatenate([angles1 - 360, angles1, angles1 + 360])
+    distances1_ext = np.concatenate([distances1, distances1, distances1])
+    depths1_ext = np.concatenate([depths1, depths1, depths1])
+
+    angles2_ext = np.concatenate([angles2 - 360, angles2, angles2 + 360])
+    distances2_ext = np.concatenate([distances2, distances2, distances2])
+    depths2_ext = np.concatenate([depths2, depths2, depths2])
+
+    from scipy.interpolate import interp1d
+
+    f_dist1 = interp1d(angles1_ext, distances1_ext, kind='linear')
+    f_depth1 = interp1d(angles1_ext, depths1_ext, kind='linear')
+    f_dist2 = interp1d(angles2_ext, distances2_ext, kind='linear')
+    f_depth2 = interp1d(angles2_ext, depths2_ext, kind='linear')
+
+    interp_distances1 = f_dist1(common_angles)
+    interp_depths1 = f_depth1(common_angles)
+    interp_distances2 = f_dist2(common_angles)
+    interp_depths2 = f_depth2(common_angles)
+
+    return {
+        'angles': common_angles.tolist(),
+        'distances1': interp_distances1.tolist(),
+        'distances2': interp_distances2.tolist(),
+        'depths1': interp_depths1.tolist(),
+        'depths2': interp_depths2.tolist()
+    }
+
+
+def calculate_deformation_heatmap(measurements_base: List[Dict], measurements_compare: List[Dict]) -> Dict:
+    interp = interpolate_to_common_angles(measurements_base, measurements_compare)
+
+    if not interp['angles']:
+        return {
+            'angles': [],
+            'distance_diff': [],
+            'depth_diff': [],
+            'max_distance_expansion': 0,
+            'max_distance_contraction': 0,
+            'max_depth_increase': 0,
+            'max_depth_decrease': 0,
+            'avg_distance_change': 0,
+            'avg_depth_change': 0
+        }
+
+    distances1 = np.array(interp['distances1'])
+    distances2 = np.array(interp['distances2'])
+    depths1 = np.array(interp['depths1'])
+    depths2 = np.array(interp['depths2'])
+
+    distance_diff = distances2 - distances1
+    depth_diff = depths2 - depths1
+
+    return {
+        'angles': interp['angles'],
+        'distance_diff': distance_diff.tolist(),
+        'depth_diff': depth_diff.tolist(),
+        'max_distance_expansion': float(np.max(distance_diff)),
+        'max_distance_contraction': float(np.min(distance_diff)),
+        'max_depth_increase': float(np.max(depth_diff)),
+        'max_depth_decrease': float(np.min(depth_diff)),
+        'avg_distance_change': float(np.mean(distance_diff)),
+        'avg_depth_change': float(np.mean(depth_diff))
+    }
+
+
+def compute_cross_section_difference(measurements_base: List[Dict], measurements_compare: List[Dict]) -> Dict:
+    interp = interpolate_to_common_angles(measurements_base, measurements_compare)
+
+    if not interp['angles']:
+        return {
+            'angles': [],
+            'x_base': [], 'y_base': [],
+            'x_compare': [], 'y_compare': [],
+            'x_diff': [], 'y_diff': [],
+            'radial_diff': []
+        }
+
+    angles = np.array(interp['angles'])
+    angles_rad = np.deg2rad(angles)
+
+    distances1 = np.array(interp['distances1'])
+    distances2 = np.array(interp['distances2'])
+
+    x_base = distances1 * np.cos(angles_rad)
+    y_base = distances1 * np.sin(angles_rad)
+    x_compare = distances2 * np.cos(angles_rad)
+    y_compare = distances2 * np.sin(angles_rad)
+
+    radial_diff = distances2 - distances1
+
+    x_diff = x_compare - x_base
+    y_diff = y_compare - y_base
+
+    return {
+        'angles': angles.tolist(),
+        'x_base': x_base.tolist(),
+        'y_base': y_base.tolist(),
+        'x_compare': x_compare.tolist(),
+        'y_compare': y_compare.tolist(),
+        'x_diff': x_diff.tolist(),
+        'y_diff': y_diff.tolist(),
+        'radial_diff': radial_diff.tolist()
+    }
+
+
+def calculate_volume_trend(batches_stats: List[Dict]) -> Dict:
+    if not batches_stats:
+        return {'dates': [], 'volumes': [], 'max_depths': [], 'avg_depths': [], 'volume_changes': []}
+
+    sorted_batches = sorted(batches_stats, key=lambda x: x.get('survey_date', ''))
+
+    dates = [b.get('survey_date', b['batch_name']) for b in sorted_batches]
+    volumes = [b['volume'] for b in sorted_batches]
+    max_depths = [b['max_depth'] for b in sorted_batches]
+    avg_depths = [b['avg_depth'] for b in sorted_batches]
+
+    volume_changes = [0.0]
+    for i in range(1, len(volumes)):
+        if volumes[i - 1] > 0:
+            change = ((volumes[i] - volumes[i - 1]) / volumes[i - 1]) * 100
+        else:
+            change = 0.0
+        volume_changes.append(change)
+
+    total_volume_change = volumes[-1] - volumes[0] if len(volumes) >= 2 else 0
+    total_volume_change_pct = (total_volume_change / volumes[0] * 100) if len(volumes) >= 2 and volumes[0] > 0 else 0
+
+    return {
+        'dates': dates,
+        'volumes': volumes,
+        'max_depths': max_depths,
+        'avg_depths': avg_depths,
+        'volume_changes': volume_changes,
+        'total_volume_change': total_volume_change,
+        'total_volume_change_pct': total_volume_change_pct,
+        'batch_names': [b['batch_name'] for b in sorted_batches]
+    }
+
+
+def detect_risk_areas(measurements_base: List[Dict], measurements_compare: List[Dict],
+                      depth_threshold_pct: float = 10.0,
+                      distance_threshold_pct: float = 5.0) -> List[Dict]:
+    interp = interpolate_to_common_angles(measurements_base, measurements_compare)
+
+    if not interp['angles']:
+        return []
+
+    angles = np.array(interp['angles'])
+    depths1 = np.array(interp['depths1'])
+    depths2 = np.array(interp['depths2'])
+    distances1 = np.array(interp['distances1'])
+    distances2 = np.array(interp['distances2'])
+
+    depth_change_pct = np.where(depths1 != 0, (depths2 - depths1) / depths1 * 100, 0)
+    distance_change_pct = np.where(distances1 != 0, (distances2 - distances1) / distances1 * 100, 0)
+
+    risks = []
+
+    in_new_pit = False
+    pit_start_idx = 0
+
+    for i in range(len(angles)):
+        is_new_pit = depth_change_pct[i] > depth_threshold_pct
+
+        if is_new_pit and not in_new_pit:
+            in_new_pit = True
+            pit_start_idx = i
+        elif not is_new_pit and in_new_pit:
+            in_new_pit = False
+            pit_angles = angles[pit_start_idx:i]
+            pit_depth_changes = (depths2 - depths1)[pit_start_idx:i]
+            max_depth_increase = float(np.max(pit_depth_changes))
+            avg_depth_increase = float(np.mean(pit_depth_changes))
+
+            risks.append({
+                'risk_type': '新增凹陷',
+                'severity': '高' if max_depth_increase > np.mean(depths1) * 0.15 else '中',
+                'start_angle': float(pit_angles[0]),
+                'end_angle': float(pit_angles[-1]),
+                'max_depth_increase': max_depth_increase,
+                'avg_depth_increase': avg_depth_increase,
+                'description': f'该区域深度增加 {max_depth_increase:.2f}m（+{np.mean(pit_depth_changes)/np.mean(depths1)*100:.1f}%），存在新增凹陷风险'
+            })
+
+    if in_new_pit:
+        pit_angles = angles[pit_start_idx:]
+        pit_depth_changes = (depths2 - depths1)[pit_start_idx:]
+        max_depth_increase = float(np.max(pit_depth_changes))
+        avg_depth_increase = float(np.mean(pit_depth_changes))
+        risks.append({
+            'risk_type': '新增凹陷',
+            'severity': '高' if max_depth_increase > np.mean(depths1) * 0.15 else '中',
+            'start_angle': float(pit_angles[0]),
+            'end_angle': float(pit_angles[-1]),
+            'max_depth_increase': max_depth_increase,
+            'avg_depth_increase': avg_depth_increase,
+            'description': f'该区域深度增加 {max_depth_increase:.2f}m（+{np.mean(pit_depth_changes)/np.mean(depths1)*100:.1f}%），存在新增凹陷风险'
+        })
+
+    in_backfill = False
+    backfill_start_idx = 0
+
+    for i in range(len(angles)):
+        is_backfill = depth_change_pct[i] < -depth_threshold_pct
+
+        if is_backfill and not in_backfill:
+            in_backfill = True
+            backfill_start_idx = i
+        elif not is_backfill and in_backfill:
+            in_backfill = False
+            backfill_angles = angles[backfill_start_idx:i]
+            backfill_depth_changes = (depths2 - depths1)[backfill_start_idx:i]
+            max_depth_decrease = float(np.min(backfill_depth_changes))
+            avg_depth_decrease = float(np.mean(backfill_depth_changes))
+
+            risks.append({
+                'risk_type': '回填',
+                'severity': '中' if abs(max_depth_decrease) > np.mean(depths1) * 0.1 else '低',
+                'start_angle': float(backfill_angles[0]),
+                'end_angle': float(backfill_angles[-1]),
+                'max_depth_decrease': max_depth_decrease,
+                'avg_depth_decrease': avg_depth_decrease,
+                'description': f'该区域深度减少 {abs(max_depth_decrease):.2f}m（{np.mean(backfill_depth_changes)/np.mean(depths1)*100:.1f}%），存在回填现象'
+            })
+
+    if in_backfill:
+        backfill_angles = angles[backfill_start_idx:]
+        backfill_depth_changes = (depths2 - depths1)[backfill_start_idx:]
+        max_depth_decrease = float(np.min(backfill_depth_changes))
+        avg_depth_decrease = float(np.mean(backfill_depth_changes))
+        risks.append({
+            'risk_type': '回填',
+            'severity': '中' if abs(max_depth_decrease) > np.mean(depths1) * 0.1 else '低',
+            'start_angle': float(backfill_angles[0]),
+            'end_angle': float(backfill_angles[-1]),
+            'max_depth_decrease': max_depth_decrease,
+            'avg_depth_decrease': avg_depth_decrease,
+            'description': f'该区域深度减少 {abs(max_depth_decrease):.2f}m（{np.mean(backfill_depth_changes)/np.mean(depths1)*100:.1f}%），存在回填现象'
+        })
+
+    in_expansion = False
+    expansion_start_idx = 0
+
+    for i in range(len(angles)):
+        is_expansion = distance_change_pct[i] > distance_threshold_pct
+
+        if is_expansion and not in_expansion:
+            in_expansion = True
+            expansion_start_idx = i
+        elif not is_expansion and in_expansion:
+            in_expansion = False
+            exp_angles = angles[expansion_start_idx:i]
+            exp_dist_changes = (distances2 - distances1)[expansion_start_idx:i]
+            max_dist_increase = float(np.max(exp_dist_changes))
+            avg_dist_increase = float(np.mean(exp_dist_changes))
+
+            risks.append({
+                'risk_type': '扩容风险',
+                'severity': '高' if max_dist_increase > np.mean(distances1) * 0.1 else '中',
+                'start_angle': float(exp_angles[0]),
+                'end_angle': float(exp_angles[-1]),
+                'max_distance_increase': max_dist_increase,
+                'avg_distance_increase': avg_dist_increase,
+                'description': f'该区域半径增加 {max_dist_increase:.2f}m（+{np.mean(exp_dist_changes)/np.mean(distances1)*100:.1f}%），存在扩容风险'
+            })
+
+    if in_expansion:
+        exp_angles = angles[expansion_start_idx:]
+        exp_dist_changes = (distances2 - distances1)[expansion_start_idx:]
+        max_dist_increase = float(np.max(exp_dist_changes))
+        avg_dist_increase = float(np.mean(exp_dist_changes))
+        risks.append({
+            'risk_type': '扩容风险',
+            'severity': '高' if max_dist_increase > np.mean(distances1) * 0.1 else '中',
+            'start_angle': float(exp_angles[0]),
+            'end_angle': float(exp_angles[-1]),
+            'max_distance_increase': max_dist_increase,
+            'avg_distance_increase': avg_dist_increase,
+            'description': f'该区域半径增加 {max_dist_increase:.2f}m（+{np.mean(exp_dist_changes)/np.mean(distances1)*100:.1f}%），存在扩容风险'
+        })
+
+    return risks
+
+
+def generate_temporal_analysis_report(cave_name: str, base_batch: Dict, compare_batch: Dict,
+                                      deformation_data: Dict, volume_trend: Dict,
+                                      risk_areas: List[Dict], cs_diff_data: Dict) -> str:
+    report_lines = []
+
+    report_lines.append("=" * 60)
+    report_lines.append("盐穴多时期形变与容积演化分析报告")
+    report_lines.append("=" * 60)
+    report_lines.append("")
+
+    report_lines.append(f"盐穴名称: {cave_name}")
+    report_lines.append(f"基准批次: {base_batch['batch_name']} ({base_batch.get('survey_date', '未知日期')})")
+    report_lines.append(f"对比批次: {compare_batch['batch_name']} ({compare_batch.get('survey_date', '未知日期')})")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("一、容积变化分析")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    if volume_trend['volumes']:
+        report_lines.append(f"基准容积: {volume_trend['volumes'][0]:.2f} m³")
+        report_lines.append(f"对比容积: {volume_trend['volumes'][-1]:.2f} m³")
+        report_lines.append(f"容积变化量: {volume_trend['total_volume_change']:+.2f} m³")
+        report_lines.append(f"容积变化率: {volume_trend['total_volume_change_pct']:+.2f} %")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("二、断面形变分析")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    report_lines.append(f"最大径向扩张: {deformation_data['max_distance_expansion']:+.2f} m")
+    report_lines.append(f"最大径向收缩: {deformation_data['max_distance_contraction']:+.2f} m")
+    report_lines.append(f"平均径向变化: {deformation_data['avg_distance_change']:+.2f} m")
+    report_lines.append("")
+    report_lines.append(f"最大深度增加: {deformation_data['max_depth_increase']:+.2f} m")
+    report_lines.append(f"最大深度减少: {deformation_data['max_depth_decrease']:+.2f} m")
+    report_lines.append(f"平均深度变化: {deformation_data['avg_depth_change']:+.2f} m")
+    report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("三、风险区域分析")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    if risk_areas:
+        for i, risk in enumerate(risk_areas, 1):
+            report_lines.append(f"{i}. {risk['risk_type']} - 严重程度: {risk['severity']}")
+            report_lines.append(f"   角度范围: {risk['start_angle']:.1f}° - {risk['end_angle']:.1f}°")
+            report_lines.append(f"   描述: {risk['description']}")
+            report_lines.append("")
+    else:
+        report_lines.append("未检测到显著风险区域。")
+        report_lines.append("")
+
+    report_lines.append("-" * 60)
+    report_lines.append("四、容积变化趋势")
+    report_lines.append("-" * 60)
+    report_lines.append("")
+
+    for i, (name, vol, change) in enumerate(zip(
+        volume_trend.get('batch_names', []),
+        volume_trend['volumes'],
+        volume_trend['volume_changes']
+    )):
+        if i == 0:
+            report_lines.append(f"{i + 1}. {name}: {vol:.2f} m³ (基准)")
+        else:
+            report_lines.append(f"{i + 1}. {name}: {vol:.2f} m³ ({change:+.2f}%)")
+    report_lines.append("")
+
+    report_lines.append("=" * 60)
+    report_lines.append("报告生成完毕")
+    report_lines.append("=" * 60)
+
+    return "\n".join(report_lines)
