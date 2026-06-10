@@ -17,6 +17,7 @@ from analysis import (
     compute_cross_section_difference, calculate_volume_trend,
     detect_risk_areas, generate_temporal_analysis_report
 )
+import json
 
 dash.register_page(__name__, path='/temporal-analysis', name='时序演化分析')
 
@@ -78,6 +79,8 @@ def layout():
                 ),
             ], width=12),
         ], className='mb-4'),
+
+        html.Div(id='ta-error-message'),
 
         dbc.Tabs([
             dbc.Tab(label='形变热力图', tab_id='heatmap-tab'),
@@ -149,6 +152,7 @@ def update_batch_selectors(cave_id):
 
 @callback(
     Output('ta-analysis-results', 'data'),
+    Output('ta-error-message', 'children'),
     Input('ta-analyze-btn', 'n_clicks'),
     State('ta-cave-selector', 'value'),
     State('ta-base-batch-selector', 'value'),
@@ -157,10 +161,16 @@ def update_batch_selectors(cave_id):
 )
 def run_analysis(n_clicks, cave_id, base_batch_id, compare_batch_id):
     if not cave_id or not base_batch_id or not compare_batch_id:
-        return None
+        return None, ''
 
     if base_batch_id == compare_batch_id:
-        return None
+        return None, dbc.Alert(
+            [
+                html.I(className="bi bi-exclamation-triangle-fill me-2"),
+                "基准批次和对比批次不能相同，请选择两个不同的批次进行分析。"
+            ],
+            color="danger"
+        )
 
     cave = get_cave(cave_id)
     base_batch = get_batch(base_batch_id)
@@ -170,7 +180,13 @@ def run_analysis(n_clicks, cave_id, base_batch_id, compare_batch_id):
     compare_measurements = get_measurements_by_batch(compare_batch_id)
 
     if not base_measurements or not compare_measurements:
-        return None
+        return None, dbc.Alert(
+            [
+                html.I(className="bi bi-exclamation-triangle-fill me-2"),
+                "所选批次缺少测量数据，请选择有数据的批次。"
+            ],
+            color="warning"
+        )
 
     base_stats = compute_batch_statistics(base_batch_id, base_measurements)
     base_stats['batch_name'] = base_batch['batch_name']
@@ -184,7 +200,18 @@ def run_analysis(n_clicks, cave_id, base_batch_id, compare_batch_id):
 
     deformation = calculate_deformation_heatmap(base_measurements, compare_measurements)
     cs_diff = compute_cross_section_difference(base_measurements, compare_measurements)
-    volume_trend = calculate_volume_trend(all_batches)
+
+    all_cave_batches = get_batches_by_cave(cave_id)
+    all_batch_stats = []
+    for batch in all_cave_batches:
+        measurements = get_measurements_by_batch(batch['id'])
+        if measurements:
+            stats = compute_batch_statistics(batch['id'], measurements)
+            stats['batch_name'] = batch['batch_name']
+            stats['survey_date'] = batch.get('survey_date', '')
+            all_batch_stats.append(stats)
+
+    volume_trend = calculate_volume_trend(all_batch_stats)
     risk_areas = detect_risk_areas(base_measurements, compare_measurements)
 
     results = {
@@ -199,7 +226,7 @@ def run_analysis(n_clicks, cave_id, base_batch_id, compare_batch_id):
         'risk_areas': risk_areas,
     }
 
-    return results
+    return results, ''
 
 
 @callback(
@@ -563,6 +590,15 @@ def render_volume_trend_tab(results):
     compare_stats = results['compare_stats']
 
     return html.Div([
+        dbc.Alert(
+            [
+                html.I(className="bi bi-info-circle me-2"),
+                "下图展示该盐穴所有历史勘测批次的容积变化趋势。"
+            ],
+            color="info",
+            className="mb-3"
+        ),
+
         dcc.Graph(
             figure=create_volume_trend_figure(volume_trend),
             style={'height': '500px'}
@@ -758,7 +794,7 @@ def render_risk_tab(results):
                     ]),
                     dbc.CardBody([
                         html.P(f"共检测到 {len(new_pits)} 处新增凹陷风险区域"),
-                        html.Div(id='ta-new-pits-list')
+                        html.Div(create_risk_detail_list(new_pits, 'depth_increase'))
                     ])
                 ])
             ], width=4),
@@ -770,7 +806,7 @@ def render_risk_tab(results):
                     ]),
                     dbc.CardBody([
                         html.P(f"共检测到 {len(backfills)} 处回填区域"),
-                        html.Div(id='ta-backfill-list')
+                        html.Div(create_risk_detail_list(backfills, 'depth_decrease'))
                     ])
                 ])
             ], width=4),
@@ -782,7 +818,7 @@ def render_risk_tab(results):
                     ]),
                     dbc.CardBody([
                         html.P(f"共检测到 {len(expansions)} 处扩容风险区域"),
-                        html.Div(id='ta-expansion-list')
+                        html.Div(create_risk_detail_list(expansions, 'distance_increase'))
                     ])
                 ])
             ], width=4),
@@ -839,6 +875,50 @@ def render_risk_tab(results):
             ])
         ]),
     ])
+
+
+def create_risk_detail_list(risk_areas, change_type):
+    if not risk_areas:
+        return html.P("暂无风险区域", className="text-muted fst-italic")
+
+    items = []
+    for i, risk in enumerate(risk_areas, 1):
+        if change_type == 'depth_increase':
+            change_val = risk.get('max_depth_increase', 0)
+            change_text = f"最大加深 {change_val:+.2f}m"
+        elif change_type == 'depth_decrease':
+            change_val = risk.get('max_depth_decrease', 0)
+            change_text = f"最大变浅 {change_val:+.2f}m"
+        else:
+            change_val = risk.get('max_distance_increase', 0)
+            change_text = f"最大扩张 {change_val:+.2f}m"
+
+        severity_color = {
+            '高': 'danger',
+            '中': 'warning',
+            '低': 'info'
+        }.get(risk['severity'], 'secondary')
+
+        items.append(
+            dbc.ListGroupItem([
+                dbc.Row([
+                    dbc.Col([
+                        html.Strong(f"#{i} "),
+                        html.Span(f"{risk['start_angle']:.0f}° - {risk['end_angle']:.0f}°")
+                    ], width=8),
+                    dbc.Col([
+                        dbc.Badge(risk['severity'], color=severity_color, className='float-end')
+                    ], width=4),
+                ]),
+                html.Small([
+                    change_text,
+                    html.Br(),
+                    html.Span(risk['description'], className="text-muted")
+                ])
+            ], className="mb-2")
+        )
+
+    return dbc.ListGroup(items, flush=True)
 
 
 def format_risk_table_data(risk_areas):
